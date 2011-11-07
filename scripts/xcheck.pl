@@ -16,6 +16,10 @@ use Data::Dump qw( pp );
 use RRD::Simple;
 use Try::Tiny;
 
+my %opts;
+
+@ARGV = grep { $_ =~ /^-(.*)/ ? ( do { $opts{$1}++ ; undef } ) : 1 } @ARGV;
+
 sub nameserver {
   my ( $id, $ip ) = @_;
   return $id => {
@@ -48,8 +52,12 @@ my (@errors);
 
 *STDOUT->autoflush(1);
 
+use Path::Class::Dir;
+
+my $project_root=Path::Class::Dir->new( '/home/kent/dnscheck' );
+
 my $ns_times_graph = Grapher->new(
-  root_dir          => '/tmp/rrd/times',
+  root_dir          => $project_root->subdir('times')->stringify,
   image_basename    => 'ns_times',
   rrd_file_basename => 'ns_times',
   fields            => [ map { $_->{tcp_times}, $_->{udp_times} } values %nsmap ],
@@ -58,7 +66,7 @@ my $ns_times_graph = Grapher->new(
 $ns_times_graph->create();
 
 my $ns_success_graph = Grapher->new(
-  root_dir          => '/tmp/rrd/success',
+  root_dir          => $project_root->subdir('success')->stringify,
   image_basename    => 'ns_success',
   rrd_file_basename => 'ns_success',
   fields            => [ map { $_->{tcp_success}, $_->{udp_success} } values %nsmap ],
@@ -66,13 +74,57 @@ my $ns_success_graph = Grapher->new(
 
 $ns_success_graph->create();
 
+my ( @log_errors ) = ();
+my ( @log_trace  ) = ();
+{
+  open my $fh, '>>', $project_root->file('errors.log');
+  push @log_errors, $fh;
+  $fh->autoflush(1);
+#  push @log_errors, \*STDERR;
+}
+{
+  open my $fh, '>>', $project_root->file('trace.log');
+  push @log_trace, $fh;
+  $fh->autoflush(1);
+  push @log_trace, \*STDOUT;
+  *STDOUT->autoflush(1);
+}
+sub timestamp {
+  my $ts = gettimeofday;
+  my $ts_string = gmtime;
+  return "$ts $ts_string";
+}
+sub log_error_n {
+  for my $fh ( @log_errors ) {
+    $fh->print(timestamp, " ");
+    $fh->print( @_ ,"\n" );
+  }
+}
+sub log_trace {
+  for my $fh ( @log_trace ) {
+    $fh->print( @_  );
+  }
+}
+sub log_trace_n {
+  return log_trace( @_ , "\n");
+}
+
 while (1) {
-  print "# Updating Graphs\n";
+  if( $opts{-debug} ) { 
+    log_trace_n(timestamp,);
+    log_trace_n("# Updating Graphs");
+  } else {
+    log_trace("G");
+  }
+
   $ns_times_graph->render();
   $ns_success_graph->render();
 
   for my $pass ( 1 .. 5 ) {
-
+    if ( not $opts{-debug} ) {
+      log_trace("\n");
+    }
+    log_trace_n(timestamp,);
     for my $proto (qw( tcp udp )) {
 
       for my $nameserver ( sort keys %nsmap ) {
@@ -82,7 +134,7 @@ while (1) {
 
         my $ip = $nsmap{$nameserver}->{ip};
 
-        $ns_success_graph->set_value( $nss_key, 0 );
+        $ns_success_graph->set_value( $nss_key, 0.5 );
 
         my $result;
         my (@before) = gettimeofday;
@@ -90,23 +142,36 @@ while (1) {
         for my $answer ( answers_for( $proto, $ip ) ) {
           if ( not $result ) {
             $ns_success_graph->set_value( $nss_key, 1 );
-            $delay = tv_interval( \@before, [ gettimeofday ]);
+            $delay = tv_interval( \@before, [gettimeofday] );
             $ns_times_graph->set_value( $nst_key, $delay );
           }
           $result++;
-          print "# $nameserver $proto : $result " . $answer->address . " " . $answer->ttl . " $delay\n";
+          if ( $opts{-debug} ){ 
+            log_trace_n("# $nameserver $proto : $result " . $answer->address . " " . $answer->ttl . " $delay");
+          } else {
+            log_trace('.');
+          }
         }
         if ( not $result ) {
-          print "FAIL: $nameserver $proto\n";
+          if ( not $opts{-debug} ){ 
+            log_trace('x');
+            log_error_n("FAIL: $nameserver $proto $ip");
+          } else {
+            log_error_n("FAIL: $nameserver $proto $ip");
+          }
         }
       }
     }
 
     $ns_times_graph->commit();
     $ns_success_graph->commit();
-    print "# Sleeping 20s\n";
-    sleep 20;
 
+    if( $opts{-debug} ) { 
+      log_trace_n('# Sleeping 20s');
+    } else {
+      log_trace('>');
+    }
+    sleep 20;
   }
 }
 
@@ -187,13 +252,13 @@ BEGIN {
   sub render {
     my $self = shift;
     my %rtn  = $self->_rrd->graph(
-      destination    => $self->root_dir,
-      basename       => $self->image_basename,
-      periods        => $self->graph_periods,
-      line_thickness => 1,
+      destination     => $self->root_dir,
+      basename        => $self->image_basename,
+      periods         => $self->graph_periods,
+      line_thickness  => 1,
       extended_legend => 1,
-      height => 600,
-      width => 600,
+      height          => 600,
+      width           => 600,
     );
     return %rtn;
   }
@@ -240,14 +305,14 @@ sub answers_for {
   my $message = gen_message($proto);
   $con->send($message);
   my $buf;
-  
+
   # Timeout/Error
 
-  return unless IO::Select->new( $con )->can_read( 1.0 );
-  
+  return unless IO::Select->new($con)->can_read(1.0);
+
   $con->recv( $buf, 4096 );
   if ( length $buf < 100 ) {
-    push @errors, [ [ gettimeofday() ], $@, $!, $?, "$@ $! $?" ];
+    push @errors, [ [ gettimeofday() ], $@, $!, $?, "$! $?" ];
     return;
   }
   if ( $proto eq 'tcp' ) {
